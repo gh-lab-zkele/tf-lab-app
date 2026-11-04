@@ -28,7 +28,19 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y openjdk-17-jre-headless
-          pip3 install pytest pytest-xdist zapcli "urllib3<2"
+
+      - name: Set up Python for ZAP CLI
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install ZAP CLI
+        run: |
+          python -m venv "$RUNNER_TEMP/zapcli-venv"
+          "$RUNNER_TEMP/zapcli-venv/bin/python" -m pip install --upgrade pip
+          "$RUNNER_TEMP/zapcli-venv/bin/python" -m pip install zapcli "urllib3==1.26.20"
+          "$RUNNER_TEMP/zapcli-venv/bin/python" -c "import urllib3; print('Using urllib3', urllib3.__version__); assert urllib3.__version__ == '1.26.20'"
+          echo "ZAP_CLI=$RUNNER_TEMP/zapcli-venv/bin/zap-cli" >> "$GITHUB_ENV"
 
       - name: Install OWASP ZAP
         run: |
@@ -95,7 +107,7 @@ jobs:
       - name: Start ZAP
         run: |
           "$ZAP_PATH/zap.sh" -daemon -host 0.0.0.0 -port 8090 -config api.disablekey=true &
-          zap-cli -p 8090 status -t 120
+          "$ZAP_CLI" -p 8090 status -t 120
 
           : "${APP_USERNAME:?GitHub secret USERNAME is required}"
           : "${APP_PASSWORD:?GitHub secret PASSWORD is required}"
@@ -121,13 +133,15 @@ jobs:
 
       - name: Run ZAP scan (DAST)
         run: |
-          zap-cli -p 8090 status -t 120
-          zap-cli -p 8090 -v quick-scan --spider "http://127.0.0.1:3123/"
+          "$ZAP_CLI" -p 8090 status -t 120
+          "$ZAP_CLI" -p 8090 -v quick-scan --spider "http://127.0.0.1:3123/"
 
       - name: Stop App and ZAP
         if: always()
         run: |
-          zap-cli -p 8090 shutdown || true
+          if [ -n "${ZAP_CLI:-}" ]; then
+            "$ZAP_CLI" -p 8090 shutdown || true
+          fi
           if [ -f app.pid ]; then
             kill "$(cat app.pid)" 2>/dev/null || true
           fi
