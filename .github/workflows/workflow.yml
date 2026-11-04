@@ -148,7 +148,7 @@ jobs:
             --data-urlencode "matchRegex=false" \
             --data-urlencode "matchString=Authorization" \
             --data-urlencode "replacement=Bearer $AUTH_TOKEN" \
-            "http://127.0.0.1:8090/JSON/replacer/action/addRule/"
+            "http://127.0.0.1:8090/JSON/replacer/action/addRule/")
           if [ "$REPLACER_STATUS" != 200 ]; then
             echo "ZAP rejected the authentication rule with HTTP $REPLACER_STATUS:"
             cat "$RUNNER_TEMP/zap-replacer-response.json"
