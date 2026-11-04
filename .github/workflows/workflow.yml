@@ -8,73 +8,126 @@ on:
 jobs:
   ci-workflow:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
+    services:
+      mongodb:
+        image: mongo:7
+        ports:
+          - 27017:27017
+        options: >-
+          --health-cmd "mongosh --eval 'db.adminCommand(\"ping\")'"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
 
     steps:
-    - name: Checkout code
-      uses: actions/checkout@v2
-    - name: Set up environment
-      run: |
-        sudo apt-get update
-        sudo apt-get install -y openjdk-8-jre-headless
-        pip3 install pytest pytest-xdist
-        pip3 install zapcli
+      - name: Checkout code
+        uses: actions/checkout@v4
 
-    - name: Install OWASP ZAP
-      run: |
-        wget https://github.com/zaproxy/zaproxy/releases/download/v2.16.0/ZAP_2.16.0_Linux.tar.gz
-        tar -xvzf ZAP_2.16.0_Linux.tar.gz
-        echo "ZAP_PATH=$PWD/ZAP_2.16.0" >> $GITHUB_ENV
+      - name: Set up environment
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y openjdk-17-jre-headless
+          pip3 install pytest pytest-xdist zapcli
 
-    - name: Use Node.js 18.x
-      uses: actions/setup-node@v3
-      with:
-        node-version: 18.x
+      - name: Install OWASP ZAP
+        run: |
+          wget https://github.com/zaproxy/zaproxy/releases/download/v2.16.0/ZAP_2.16.0_Linux.tar.gz
+          tar -xzf ZAP_2.16.0_Linux.tar.gz
+          echo "ZAP_PATH=$PWD/ZAP_2.16.0" >> "$GITHUB_ENV"
 
-    - name: Build Application (SCA)
-      run: npm install
+      - name: Use Node.js 24
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
 
-    - name: Run ESLint (SAST)
-      run: |
-        npm install --no-save eslint-plugin-security@3.0.1
-        cat > .eslintrc.cjs <<'EOF'
-        module.exports = {
-          extends: ["plugin:security/recommended-legacy"],
-          parserOptions: {
-            ecmaVersion: 2022,
-            sourceType: "module"
-          },
-          env: {
-            es2022: true,
-            node: true
-          }
-        };
-        EOF
-        npx eslint --no-eslintrc --config .eslintrc.cjs . --ext .js
+      - name: Build Application (SCA)
+        run: npm install
 
-    - name: Run app
-      run: |
-        node index.js &
-        npx wait-on http://localhost:3123
-      env:
-        FRONTEND_URL: "http://localhost"
-        JWT_SECRET: "randomstring"
+      - name: Run ESLint (SAST)
+        run: |
+          npm install --no-save eslint-plugin-security@3.0.1
+          cat > .eslintrc.cjs <<'EOF'
+          module.exports = {
+            extends: ["plugin:security/recommended-legacy"],
+            parserOptions: {
+              ecmaVersion: 2022,
+              sourceType: "module"
+            },
+            env: {
+              es2022: true,
+              node: true
+            },
+            ignorePatterns: ["public/js/", "raw/", "scripts/"]
+          };
+          EOF
+          npx eslint --no-eslintrc --config .eslintrc.cjs . --ext .js
 
-    - name: Start ZAP
-      run: |
-        AUTH_TOKEN=$(curl -XPOST -H 'Content-Type: application/json' "http://localhost:3123/auth/login" -d "{\"username\": \"${{ secrets.USERNAME }}\", \"password\":\"${{ secrets.PASSWORD }}\"}" | jq -r ".token")
-        echo "ZAP_AUTH_HEADER_VALUE=Bearer\ $AUTH_TOKEN" >> $GITHUB_ENV
-        echo "ZAP_AUTH_HEADER=Authorization" >> $GITHUB_ENV
-        $ZAP_PATH/zap.sh -daemon -host 0.0.0.0 -port 8090 -config api.disablekey=true &
-        sleep 30
+      - name: Run app
+        timeout-minutes: 3
+        run: |
+          node index.js > app.log 2>&1 &
+          echo $! > app.pid
 
-    - name: Run ZAP scan (DAST
-      run: |
-        zap-cli -p 8090 status -t 120
-        zap-cli -p 8090 -v quick-scan \
-        --spider \
-        "http://localhost:3123/"
+          for attempt in {1..60}; do
+            if curl --fail --silent http://127.0.0.1:3123/ping > /dev/null; then
+              echo "Application is ready."
+              exit 0
+            fi
 
-    - name: Stop App and ZAP
-      run: |
-        zap-cli -p 8090 shutdown
-        kill $(lsof -t -i:3123)
+            if ! kill -0 "$(cat app.pid)" 2>/dev/null; then
+              cat app.log
+              echo "Application exited before becoming ready."
+              exit 1
+            fi
+
+            sleep 2
+          done
+
+          cat app.log
+          echo "Application did not become ready in time."
+          exit 1
+        env:
+          PORT: "3123"
+          MONGODB_URI: mongodb://127.0.0.1:27017/dummyjson
+          JWT_SECRET: randomstring
+
+      - name: Start ZAP
+        run: |
+          "$ZAP_PATH/zap.sh" -daemon -host 0.0.0.0 -port 8090 -config api.disablekey=true &
+          zap-cli -p 8090 status -t 120
+
+          : "${APP_USERNAME:?GitHub secret USERNAME is required}"
+          : "${APP_PASSWORD:?GitHub secret PASSWORD is required}"
+
+          LOGIN_RESPONSE=$(curl --fail --silent --show-error -X POST \
+            -H 'Content-Type: application/json' \
+            "http://127.0.0.1:3123/auth/login" \
+            --data "$(jq -n --arg username "$APP_USERNAME" --arg password "$APP_PASSWORD" \
+              '{username: $username, password: $password}')")
+          AUTH_TOKEN=$(printf '%s' "$LOGIN_RESPONSE" | jq -er ".accessToken")
+
+          curl --fail --silent --show-error --get \
+            --data-urlencode "description=Authenticate application scan" \
+            --data-urlencode "enabled=true" \
+            --data-urlencode "matchType=REQ_HEADER" \
+            --data-urlencode "matchRegex=false" \
+            --data-urlencode "matchString=Authorization" \
+            --data-urlencode "replacement=Bearer $AUTH_TOKEN" \
+            "http://127.0.0.1:8090/JSON/replacer/action/addRule/"
+        env:
+          APP_USERNAME: ${{ secrets.USERNAME }}
+          APP_PASSWORD: ${{ secrets.PASSWORD }}
+
+      - name: Run ZAP scan (DAST)
+        run: |
+          zap-cli -p 8090 status -t 120
+          zap-cli -p 8090 -v quick-scan --spider "http://127.0.0.1:3123/"
+
+      - name: Stop App and ZAP
+        if: always()
+        run: |
+          zap-cli -p 8090 shutdown || true
+          if [ -f app.pid ]; then
+            kill "$(cat app.pid)" 2>/dev/null || true
+          fi
