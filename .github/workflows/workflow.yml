@@ -34,7 +34,22 @@ jobs:
       run: npm install
 
     - name: Run ESLint (SAST)
-      run: npx eslint . --ext .js
+      run: |
+        npm install --no-save eslint-plugin-security@3.0.1
+        cat > .eslintrc.cjs <<'EOF'
+        module.exports = {
+          extends: ["plugin:security/recommended"],
+          parserOptions: {
+            ecmaVersion: 2022,
+            sourceType: "module"
+          },
+          env: {
+            es2022: true,
+            node: true
+          }
+        };
+        EOF
+        npx eslint --no-eslintrc --config .eslintrc.cjs . --ext .js
 
     - name: Run app
       run: |
