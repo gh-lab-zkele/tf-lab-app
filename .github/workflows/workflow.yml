@@ -123,14 +123,25 @@ jobs:
           : "${APP_USERNAME:?GitHub secret USERNAME is required}"
           : "${APP_PASSWORD:?GitHub secret PASSWORD is required}"
 
-          LOGIN_RESPONSE=$(curl --fail --silent --show-error -X POST \
+          LOGIN_STATUS=$(curl --silent --show-error \
+            --output "$RUNNER_TEMP/login-response.json" \
+            --write-out '%{http_code}' \
+            -X POST \
             -H 'Content-Type: application/json' \
             "http://127.0.0.1:3123/auth/login" \
             --data "$(jq -n --arg username "$APP_USERNAME" --arg password "$APP_PASSWORD" \
               '{username: $username, password: $password}')")
-          AUTH_TOKEN=$(printf '%s' "$LOGIN_RESPONSE" | jq -er ".accessToken")
+          if [ "$LOGIN_STATUS" != 200 ]; then
+            echo "Application login failed with HTTP $LOGIN_STATUS:"
+            jq -r '.message // .error // "No error details returned"' "$RUNNER_TEMP/login-response.json"
+            exit 1
+          fi
+          AUTH_TOKEN=$(jq -er ".accessToken" "$RUNNER_TEMP/login-response.json")
 
-          curl --fail --silent --show-error --get \
+          REPLACER_STATUS=$(curl --silent --show-error \
+            --output "$RUNNER_TEMP/zap-replacer-response.json" \
+            --write-out '%{http_code}' \
+            --get \
             --data-urlencode "description=Authenticate application scan" \
             --data-urlencode "enabled=true" \
             --data-urlencode "matchType=REQ_HEADER" \
@@ -138,6 +149,11 @@ jobs:
             --data-urlencode "matchString=Authorization" \
             --data-urlencode "replacement=Bearer $AUTH_TOKEN" \
             "http://127.0.0.1:8090/JSON/replacer/action/addRule/"
+          if [ "$REPLACER_STATUS" != 200 ]; then
+            echo "ZAP rejected the authentication rule with HTTP $REPLACER_STATUS:"
+            cat "$RUNNER_TEMP/zap-replacer-response.json"
+            exit 1
+          fi
         env:
           APP_USERNAME: ${{ secrets.USERNAME }}
           APP_PASSWORD: ${{ secrets.PASSWORD }}
