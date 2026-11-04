@@ -29,19 +29,6 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y openjdk-17-jre-headless
 
-      - name: Set up Python for ZAP CLI
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-
-      - name: Install ZAP CLI
-        run: |
-          python -m venv "$RUNNER_TEMP/zapcli-venv"
-          "$RUNNER_TEMP/zapcli-venv/bin/python" -m pip install --upgrade pip
-          "$RUNNER_TEMP/zapcli-venv/bin/python" -m pip install zapcli "urllib3==1.26.20"
-          "$RUNNER_TEMP/zapcli-venv/bin/python" -c "import urllib3; print('Using urllib3', urllib3.__version__); assert urllib3.__version__ == '1.26.20'"
-          echo "ZAP_CLI=$RUNNER_TEMP/zapcli-venv/bin/zap-cli" >> "$GITHUB_ENV"
-
       - name: Install OWASP ZAP
         run: |
           wget https://github.com/zaproxy/zaproxy/releases/download/v2.16.0/ZAP_2.16.0_Linux.tar.gz
@@ -105,9 +92,33 @@ jobs:
           JWT_SECRET: randomstring
 
       - name: Start ZAP
+        timeout-minutes: 3
         run: |
-          "$ZAP_PATH/zap.sh" -daemon -host 0.0.0.0 -port 8090 -config api.disablekey=true &
-          "$ZAP_CLI" -p 8090 status -t 120
+          "$ZAP_PATH/zap.sh" -cmd -addonuninstall client
+          "$ZAP_PATH/zap.sh" -daemon -host 0.0.0.0 -port 8090 -config api.disablekey=true > zap.log 2>&1 &
+          echo $! > zap.pid
+
+          ZAP_READY=false
+          for attempt in {1..120}; do
+            if curl --silent --fail http://127.0.0.1:8090/JSON/core/view/version/ | jq -e '.version' > /dev/null; then
+              ZAP_READY=true
+              break
+            fi
+
+            if ! kill -0 "$(cat zap.pid)" 2>/dev/null; then
+              cat zap.log
+              echo "ZAP exited before its API became ready."
+              exit 1
+            fi
+
+            sleep 1
+          done
+
+          if [ "$ZAP_READY" != true ]; then
+            cat zap.log
+            echo "ZAP API did not become ready in time."
+            exit 1
+          fi
 
           : "${APP_USERNAME:?GitHub secret USERNAME is required}"
           : "${APP_PASSWORD:?GitHub secret PASSWORD is required}"
@@ -132,16 +143,50 @@ jobs:
           APP_PASSWORD: ${{ secrets.PASSWORD }}
 
       - name: Run ZAP scan (DAST)
+        timeout-minutes: 10
         run: |
-          "$ZAP_CLI" -p 8090 status -t 120
-          "$ZAP_CLI" -p 8090 -v quick-scan --spider "http://127.0.0.1:3123/"
+          SPIDER_RESPONSE=$(curl --fail --silent --show-error --get \
+            --data-urlencode "url=http://127.0.0.1:3123/" \
+            "http://127.0.0.1:8090/JSON/spider/action/scan/")
+          SCAN_ID=$(printf '%s' "$SPIDER_RESPONSE" | jq -er '.scan')
+
+          SCAN_COMPLETE=false
+          for attempt in {1..180}; do
+            SCAN_STATUS=$(curl --fail --silent --show-error --get \
+              --data-urlencode "scanId=$SCAN_ID" \
+              "http://127.0.0.1:8090/JSON/spider/view/status/" | jq -er '.status | tonumber')
+            if [ "$SCAN_STATUS" -eq 100 ]; then
+              SCAN_COMPLETE=true
+              break
+            fi
+            sleep 2
+          done
+
+          if [ "$SCAN_COMPLETE" != true ]; then
+            echo "ZAP spider scan did not complete in time."
+            exit 1
+          fi
+
+          PASSIVE_SCAN_COMPLETE=false
+          for attempt in {1..180}; do
+            RECORDS_TO_SCAN=$(curl --fail --silent --show-error \
+              "http://127.0.0.1:8090/JSON/pscan/view/recordsToScan/" | jq -er '.recordsToScan | tonumber')
+            if [ "$RECORDS_TO_SCAN" -eq 0 ]; then
+              PASSIVE_SCAN_COMPLETE=true
+              break
+            fi
+            sleep 2
+          done
+
+          if [ "$PASSIVE_SCAN_COMPLETE" != true ]; then
+            echo "ZAP passive scan queue did not drain in time."
+            exit 1
+          fi
 
       - name: Stop App and ZAP
         if: always()
         run: |
-          if [ -n "${ZAP_CLI:-}" ]; then
-            "$ZAP_CLI" -p 8090 shutdown || true
-          fi
+          curl --silent --fail http://127.0.0.1:8090/JSON/core/action/shutdown/ > /dev/null || true
           if [ -f app.pid ]; then
             kill "$(cat app.pid)" 2>/dev/null || true
           fi
