@@ -131,7 +131,7 @@ jobs:
           AUTH_TOKEN=$(printf '%s' "$LOGIN_RESPONSE" | jq -er ".accessToken")
 
           curl --fail --silent --show-error --get \
-            --data-urlencode "desc=Authenticate application scan" \
+            --data-urlencode "description=Authenticate application scan" \
             --data-urlencode "enabled=true" \
             --data-urlencode "matchType=REQ_HEADER" \
             --data-urlencode "matchRegex=false" \
